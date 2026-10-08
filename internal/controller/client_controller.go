@@ -76,6 +76,12 @@ func (r *ClientReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
+	// Handle deletion first: the referenced Secret may already be gone (e.g. namespace deletion)
+	// and must not prevent the finalizer from being removed.
+	if !kcClient.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, &kcClient)
+	}
+
 	// Validate required fields
 	if kcClient.Spec.Realm == nil {
 		err := fmt.Errorf("realm is required")
@@ -104,34 +110,7 @@ func (r *ClientReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// 2. Handle deletion logic with finalizer
-	if !kcClient.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(&kcClient, clientFinalizer) {
-			// Resource is being deleted, perform cleanup
-			// Get clientID from secret before deletion
-			deleteClientID, _, err := r.getClientCredentials(ctx, &kcClient)
-			if err != nil {
-				logger.Error(err, "Failed to get client credentials for deletion, skipping Keycloak cleanup")
-				// Continue with finalizer removal even if we can't read the secret
-			} else {
-				if err := r.deleteClientInKeycloak(ctx, r.KeycloakClient, token.AccessToken, &kcClient, deleteClientID); err != nil {
-					logger.Error(err, "Failed to delete client in Keycloak")
-					r.updateStatus(ctx, &kcClient, metav1.ConditionFalse, "DeletionFailed", fmt.Sprintf("Failed to delete: %v", err))
-					return ctrl.Result{}, err
-				}
-			}
-
-			// Remove finalizer to allow deletion
-			controllerutil.RemoveFinalizer(&kcClient, clientFinalizer)
-			if err := r.Update(ctx, &kcClient); err != nil {
-				logger.Error(err, "Failed to remove finalizer")
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// 3. Add finalizer if not present
+	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(&kcClient, clientFinalizer) {
 		controllerutil.AddFinalizer(&kcClient, clientFinalizer)
 		if err := r.Update(ctx, &kcClient); err != nil {
@@ -141,7 +120,10 @@ func (r *ClientReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// 4. Check if client exists in Keycloak
+	// Remember the managed clientId so deletion does not depend on the Secret
+	kcClient.Status.ClientID = clientID
+
+	// Check if client exists in Keycloak
 	clients, err := r.KeycloakClient.GetClients(ctx, token.AccessToken, *kcClient.Spec.Realm, gocloak.GetClientsParams{
 		ClientID: &clientID,
 	})
@@ -173,11 +155,13 @@ func (r *ClientReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, err
 		}
 
-		// Update secret with credentials
-		if err := r.updateSecretWithCredentials(ctx, &kcClient, createdClient.ClientID, createdClient.Secret); err != nil {
-			logger.Error(err, "Failed to update secret with credentials")
-			r.updateStatus(ctx, &kcClient, metav1.ConditionFalse, "SecretUpdateFailed", fmt.Sprintf("Failed to update secret: %v", err))
-			return ctrl.Result{}, err
+		// Only write back to the Secret when Keycloak generated the client secret
+		if clientSecret == "" {
+			if err := r.updateSecretWithCredentials(ctx, &kcClient, createdClient.ClientID, createdClient.Secret); err != nil {
+				logger.Error(err, "Failed to update secret with credentials")
+				r.updateStatus(ctx, &kcClient, metav1.ConditionFalse, "SecretUpdateFailed", fmt.Sprintf("Failed to update secret: %v", err))
+				return ctrl.Result{}, err
+			}
 		}
 
 		r.updateStatus(ctx, &kcClient, metav1.ConditionTrue, "Created", "Client successfully created in Keycloak")
@@ -198,18 +182,51 @@ func (r *ClientReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			return ctrl.Result{}, err
 		}
 
-		// Update secret with current credentials (in case secret was regenerated)
-		if updatedClient.Secret != nil {
-			if err := r.updateSecretWithCredentials(ctx, &kcClient, updatedClient.ClientID, updatedClient.Secret); err != nil {
-				logger.Error(err, "Failed to update secret with credentials")
-				// Don't fail the reconciliation for secret update failures
-			}
-		}
-
 		logger.Info("Successfully updated client in Keycloak", "clientID", clientID)
 		r.updateStatus(ctx, &kcClient, metav1.ConditionTrue, "Updated", "Client successfully updated in Keycloak")
 	}
 
+	return ctrl.Result{}, nil
+}
+
+// reconcileDelete cleans up the Keycloak client and removes the finalizer.
+func (r *ClientReconciler) reconcileDelete(ctx context.Context, kcClient *keycloakv1.Client) (ctrl.Result, error) {
+	logger := logf.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(kcClient, clientFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	deleteClientID := kcClient.Status.ClientID
+	if deleteClientID == "" {
+		id, _, err := r.getClientCredentials(ctx, kcClient)
+		if err != nil {
+			logger.Info("Unable to determine Keycloak clientId, skipping Keycloak cleanup", "reason", err.Error())
+		}
+		deleteClientID = id
+	}
+
+	if deleteClientID != "" && kcClient.Spec.Realm != nil {
+		token, err := r.KeycloakClient.LoginClient(ctx, r.KeycloakUser, r.KeycloakPass, r.KeycloakRealm)
+		if err != nil {
+			logger.Error(err, "Failed to authenticate with Keycloak for deletion")
+			return ctrl.Result{}, err
+		}
+		if err := r.deleteClientInKeycloak(ctx, r.KeycloakClient, token.AccessToken, kcClient, deleteClientID); err != nil {
+			logger.Error(err, "Failed to delete client in Keycloak")
+			return ctrl.Result{}, err
+		}
+	}
+
+	controllerutil.RemoveFinalizer(kcClient, clientFinalizer)
+	if err := r.Update(ctx, kcClient); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "Failed to remove finalizer")
+		return ctrl.Result{}, err
+	}
+	logger.Info("Finalizer removed", "clientID", deleteClientID)
 	return ctrl.Result{}, nil
 }
 
