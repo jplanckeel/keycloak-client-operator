@@ -193,6 +193,11 @@ spec:
           status:
             description: status defines the observed state of Client
             properties:
+              clientId:
+                description: |-
+                  clientId is the Keycloak clientId managed by this resource.
+                  It is used to clean up the Keycloak client on deletion even if the referenced Secret is gone.
+                type: string
               conditions:
                 description: |-
                   conditions represent the current state of the Client resource.

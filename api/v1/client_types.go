@@ -118,6 +118,11 @@ type ClientStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// clientId is the Keycloak clientId managed by this resource.
+	// It is used to clean up the Keycloak client on deletion even if the referenced Secret is gone.
+	// +optional
+	ClientID string `json:"clientId,omitempty"`
 }
 
 // +kubebuilder:object:root=true

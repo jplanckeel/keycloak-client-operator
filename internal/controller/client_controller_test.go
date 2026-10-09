@@ -663,6 +663,34 @@ var _ = Describe("Client Controller", func() {
 				return errors.IsNotFound(err)
 			}).Should(BeTrue())
 		})
+
+		It("Should remove finalizer when the referenced secret is missing (namespace deletion)", func() {
+			realm := testRealm
+			name := resourceName + "-missing-secret"
+			nn := types.NamespacedName{Name: name, Namespace: "default"}
+
+			resource := &keycloakv1.Client{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       name,
+					Namespace:  "default",
+					Finalizers: []string{clientFinalizer},
+				},
+				Spec: keycloakv1.ClientSpec{
+					Realm:     &realm,
+					SecretRef: keycloakv1.ClientSecretReference{Name: "does-not-exist"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			reconciler := &ClientReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: nn})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, nn, &keycloakv1.Client{}))
+			}).Should(BeTrue())
+		})
 	})
 
 	Context("When testing SAML-specific conversions", func() {
